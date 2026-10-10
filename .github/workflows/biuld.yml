@@ -1,0 +1,379 @@
+name: Biuld APK
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Projekt erzeugen
+        run: |
+          mkdir -p .
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "NoGoGuard"
+          include(":app")
+          EOF
+          mkdir -p .
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.guard"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.guard"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <application
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <receiver android:name=".AdminReceiver"
+                      android:permission="android.permission.BIND_DEVICE_ADMIN"
+                      android:exported="true">
+                      <meta-data android:name="android.app.device_admin" android:resource="@xml/device_admin"/>
+                      <intent-filter>
+                          <action android:name="android.app.action.DEVICE_ADMIN_ENABLED"/>
+                      </intent-filter>
+                  </receiver>
+                  <service android:name=".GuardService"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService"/>
+                      </intent-filter>
+                      <meta-data android:name="android.accessibilityservice" android:resource="@xml/a11y_config"/>
+                  </service>
+                  <service android:name=".DnsVpnService"
+                      android:permission="android.permission.BIND_VPN_SERVICE"
+                      android:exported="false">
+                      <intent-filter>
+                          <action android:name="android.net.VpnService"/>
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="app_name">NoGoGuard</string>
+              <string name="a11y_desc">Blockiert 18+-Inhalte und schützt die App vor dem Entfernen.</string>
+          </resources>
+          EOF
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/device_admin.xml <<'EOF'
+          <device-admin xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-policies><force-lock/></uses-policies>
+          </device-admin>
+          EOF
+          cat > app/src/main/res/xml/a11y_config.xml <<'EOF'
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:description="@string/a11y_desc"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canRetrieveWindowContent="true"
+              android:notificationTimeout="200"/>
+          EOF
+          mkdir -p app/src/main/java/com/example/guard
+          cat > app/src/main/java/com/example/guard/WordStore.kt <<'EOF'
+          package com.example.guard
+
+          import android.content.Context
+
+          object WordStore {
+              private val defaults = listOf(
+                  "porn", "porno", "xxx", "nsfw", "hentai", "onlyfans", "xvideos", "pornhub",
+                  "xhamster", "redtube", "youporn", "nackt", "nude", "erotik", "camgirl", "sexcam"
+              )
+
+              private fun prefs(c: Context) = c.getSharedPreferences("guard", Context.MODE_PRIVATE)
+
+              fun all(c: Context): Set<String> =
+                  defaults.toSet() + (prefs(c).getStringSet("custom", emptySet()) ?: emptySet())
+
+              fun customCount(c: Context) = prefs(c).getStringSet("custom", emptySet())?.size ?: 0
+
+              fun add(c: Context, word: String): Boolean {
+                  val w = word.trim().lowercase()
+                  if (w.length < 3) return false
+                  val s = (prefs(c).getStringSet("custom", emptySet()) ?: emptySet()).toMutableSet()
+                  s.add(w)
+                  prefs(c).edit().putStringSet("custom", s).apply()
+                  return true
+              }
+
+              fun matches(c: Context, text: String): Boolean {
+                  val t = text.lowercase()
+                  return all(c).any { t.contains(it) }
+              }
+
+              fun armed(c: Context) = prefs(c).getBoolean("armed", false)
+              fun setArmed(c: Context) = prefs(c).edit().putBoolean("armed", true).apply()
+          }
+          EOF
+          cat > app/src/main/java/com/example/guard/AdminReceiver.kt <<'EOF'
+          package com.example.guard
+
+          import android.app.admin.DeviceAdminReceiver
+          import android.content.Context
+          import android.content.Intent
+
+          class AdminReceiver : DeviceAdminReceiver() {
+              override fun onDisableRequested(context: Context, intent: Intent): CharSequence =
+                  "Wenn du das deaktivierst, ist der Schutz weg."
+          }
+          EOF
+          cat > app/src/main/java/com/example/guard/GuardService.kt <<'EOF'
+          package com.example.guard
+
+          import android.accessibilityservice.AccessibilityService
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+
+          class GuardService : AccessibilityService() {
+
+              private val protectedPkgs = setOf(
+                  "com.android.settings",
+                  "com.google.android.packageinstaller",
+                  "com.android.packageinstaller",
+                  "com.google.android.permissioncontroller",
+                  "com.android.vending"
+              )
+
+              override fun onAccessibilityEvent(e: AccessibilityEvent) {
+                  val pkg = e.packageName?.toString() ?: return
+                  if (pkg == packageName) return
+                  val root = rootInActiveWindow ?: return
+                  val sb = StringBuilder()
+                  collect(root, sb)
+                  val text = sb.toString().lowercase()
+
+                  val label = getString(R.string.app_name).lowercase()
+                  val touchesUs = WordStore.armed(this) && pkg in protectedPkgs && text.contains(label)
+
+                  if (touchesUs || WordStore.matches(this, text)) {
+                      performGlobalAction(GLOBAL_ACTION_HOME)
+                  }
+              }
+
+              private fun collect(n: AccessibilityNodeInfo?, sb: StringBuilder) {
+                  if (n == null) return
+                  n.text?.let { sb.append(it).append(' ') }
+                  n.contentDescription?.let { sb.append(it).append(' ') }
+                  for (i in 0 until n.childCount) collect(n.getChild(i), sb)
+              }
+
+              override fun onInterrupt() {}
+          }
+          EOF
+          cat > app/src/main/java/com/example/guard/DnsVpnService.kt <<'EOF'
+          package com.example.guard
+
+          import android.net.VpnService
+          import android.content.Intent
+          import android.os.ParcelFileDescriptor
+          import java.io.FileInputStream
+          import java.io.FileOutputStream
+          import java.net.DatagramPacket
+          import java.net.DatagramSocket
+          import java.net.InetAddress
+
+          class DnsVpnService : VpnService() {
+              private var tun: ParcelFileDescriptor? = null
+              @Volatile private var running = false
+
+              override fun onStartCommand(i: Intent?, f: Int, s: Int): Int {
+                  if (tun == null) {
+                      tun = Builder().setSession("NoGoGuard")
+                          .addAddress("10.8.0.2", 32)
+                          .addDnsServer("10.8.0.1")
+                          .addRoute("10.8.0.1", 32)
+                          .establish()
+                      running = true
+                      Thread { loop() }.start()
+                  }
+                  return START_STICKY
+              }
+
+              override fun onDestroy() { running = false; tun?.close(); tun = null }
+
+              private fun loop() {
+                  val fd = tun ?: return
+                  val inp = FileInputStream(fd.fileDescriptor)
+                  val out = FileOutputStream(fd.fileDescriptor)
+                  val buf = ByteArray(32767)
+                  val sock = DatagramSocket().also { protect(it) }
+                  while (running) {
+                      val n = inp.read(buf)
+                      if (n < 40) continue
+                      if ((buf[0].toInt() shr 4) != 4 || buf[9].toInt() != 17) continue
+                      val ihl = (buf[0].toInt() and 15) * 4
+                      val dns = buf.copyOfRange(ihl + 8, n)
+                      val name = qname(dns) ?: continue
+                      val reply = if (WordStore.matches(this, name)) nxdomain(dns) else forward(sock, dns) ?: continue
+                      out.write(build(buf, ihl, reply))
+                  }
+              }
+
+              private fun qend(d: ByteArray): Int {
+                  var i = 12
+                  while (i < d.size && d[i].toInt() != 0) i += (d[i].toInt() and 0xFF) + 1
+                  return minOf(i + 5, d.size)
+              }
+
+              private fun qname(d: ByteArray): String? {
+                  var i = 12
+                  val sb = StringBuilder()
+                  while (i < d.size && d[i].toInt() != 0) {
+                      val l = d[i].toInt() and 0xFF
+                      if (i + 1 + l > d.size) return null
+                      sb.append(String(d, i + 1, l)).append('.')
+                      i += l + 1
+                  }
+                  return sb.toString().trimEnd('.').lowercase()
+              }
+
+              private fun nxdomain(q: ByteArray): ByteArray {
+                  val r = q.copyOf(qend(q))
+                  r[2] = 0x81.toByte(); r[3] = 0x83.toByte()
+                  for (i in 6..11) r[i] = 0
+                  return r
+              }
+
+              private fun forward(s: DatagramSocket, q: ByteArray): ByteArray? = try {
+                  s.soTimeout = 3000
+                  s.send(DatagramPacket(q, q.size, InetAddress.getByName("1.1.1.3"), 53))
+                  val r = ByteArray(4096)
+                  val p = DatagramPacket(r, r.size)
+                  s.receive(p)
+                  r.copyOf(p.length)
+              } catch (e: Exception) { null }
+
+              private fun build(q: ByteArray, ihl: Int, dns: ByteArray): ByteArray {
+                  val total = 28 + dns.size
+                  val o = ByteArray(total)
+                  o[0] = 0x45; o[2] = (total shr 8).toByte(); o[3] = total.toByte(); o[8] = 64; o[9] = 17
+                  System.arraycopy(q, 16, o, 12, 4)
+                  System.arraycopy(q, 12, o, 16, 4)
+                  var sum = 0
+                  for (i in 0 until 20 step 2) sum += ((o[i].toInt() and 0xFF) shl 8) or (o[i + 1].toInt() and 0xFF)
+                  while (sum shr 16 != 0) sum = (sum and 0xFFFF) + (sum shr 16)
+                  val c = sum.inv() and 0xFFFF
+                  o[10] = (c shr 8).toByte(); o[11] = c.toByte()
+                  System.arraycopy(q, ihl + 2, o, 20, 2)
+                  System.arraycopy(q, ihl, o, 22, 2)
+                  val ul = 8 + dns.size
+                  o[24] = (ul shr 8).toByte(); o[25] = ul.toByte()
+                  System.arraycopy(dns, 0, o, 28, dns.size)
+                  return o
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/example/guard/MainActivity.kt <<'EOF'
+          package com.example.guard
+
+          import android.app.Activity
+          import android.app.admin.DevicePolicyManager
+          import android.content.ComponentName
+          import android.content.Intent
+          import android.net.VpnService
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.*
+
+          class MainActivity : Activity() {
+
+              private fun adminComp() = ComponentName(this, AdminReceiver::class.java)
+              private fun adminActive() =
+                  (getSystemService(DEVICE_POLICY_SERVICE) as DevicePolicyManager).isAdminActive(adminComp())
+              private fun a11yOn() =
+                  (Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: "")
+                      .contains(packageName)
+
+              override fun onResume() {
+                  super.onResume()
+                  if (adminActive() && a11yOn()) WordStore.setArmed(this)
+                  render()
+              }
+
+              private fun render() {
+                  val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(48, 96, 48, 48) }
+                  fun tv(t: String) = box.addView(TextView(this).apply { text = t; textSize = 16f; setPadding(0, 12, 0, 12) })
+                  fun btn(t: String, a: () -> Unit) = box.addView(Button(this).apply { text = t; setOnClickListener { a() } })
+
+                  tv("NoGoGuard")
+                  tv("1. Geräteadmin: " + if (adminActive()) "aktiv ✅" else "aus ❌")
+                  btn("Geräteadmin aktivieren") {
+                      startActivity(Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN)
+                          .putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, adminComp()))
+                  }
+                  tv("2. Bedienungshilfe: " + if (a11yOn()) "aktiv ✅" else "aus ❌")
+                  btn("Bedienungshilfe öffnen") { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  tv("3. DNS-Filter")
+                  btn("DNS-Filter starten") {
+                      val i = VpnService.prepare(this)
+                      if (i != null) startActivityForResult(i, 1) else startService(Intent(this, DnsVpnService::class.java))
+                  }
+                  tv("Eigene Wörter: ${WordStore.customCount(this)} (hinzufügen geht, entfernen nicht)")
+                  val et = EditText(this).apply { hint = "Neues Wort" }
+                  box.addView(et)
+                  btn("Wort hinzufügen") {
+                      if (WordStore.add(this, et.text.toString())) {
+                          et.setText(""); render()
+                      } else Toast.makeText(this, "Mindestens 3 Zeichen", Toast.LENGTH_SHORT).show()
+                  }
+                  setContentView(ScrollView(this).apply { addView(box) })
+              }
+
+              override fun onActivityResult(r: Int, res: Int, d: Intent?) {
+                  if (r == 1 && res == RESULT_OK) startService(Intent(this, DnsVpnService::class.java))
+              }
+          }
+          EOF
+      - run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nogoguard-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
